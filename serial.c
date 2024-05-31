@@ -2,8 +2,10 @@
 /* ########################################################### */
 /* #                    Imports                              # */
 /* ########################################################### */
+#include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/io.h>
+#include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -13,22 +15,31 @@
 /* ########################################################### */
 /* #                    Static declarations                  # */
 /* ########################################################### */
-static struct serial_dev_data {
+struct serial_dev_data {
   void __iomem *regs;
+  struct miscdevice miscdev;
 };
 
 static int serial_probe(struct platform_device *pdev);
 static int serial_remove(struct platform_device *pdev);
-static u32 serial_read(struct serial_dev_data *serial_data,
-                       unsigned int offset);
-
-static void serial_write(struct serial_dev_data *serial_data, u32 val,
-                         unsigned int offset);
+static u32 reg_read(struct serial_dev_data *serial_data, unsigned int offset);
+static void reg_write(struct serial_dev_data *serial_data, u32 val,
+                      unsigned int offset);
 static void init_ti_proc_specific_settings(struct platform_device *pdev);
 static void destroy_ti_proc_specific_settings(struct platform_device *pdev);
 static int serial_configure_baud_rate(struct platform_device *pdev,
                                       struct serial_dev_data *serial_data);
 static void serial_write_char(struct serial_dev_data *serial_data, char c);
+static int generate_unique_device_id(struct platform_device *pdev, char **buf);
+static ssize_t serial_read(struct file *file, char __user *buf, size_t buf_size,
+                           loff_t *buf_offset);
+static ssize_t serial_write(struct file *file, const char __user *buf,
+                            size_t buf_size, loff_t *buf_offset);
+
+struct file_operations serial_fops = {
+    .read = serial_read,
+    .write = serial_write,
+};
 
 /* ########################################################### */
 /* #                    Public API                           # */
@@ -59,6 +70,7 @@ module_platform_driver(serial_driver);
 
 int serial_probe(struct platform_device *pdev) {
   struct serial_dev_data *serial_data;
+  char *dev_id;
   int err;
 
   pr_info("Called %s\n", __func__);
@@ -77,10 +89,34 @@ int serial_probe(struct platform_device *pdev) {
 
   err = serial_configure_baud_rate(pdev, serial_data);
   if (err) {
+    pr_err("Unable to configure baud rate.");
     goto cleanup;
   }
 
   serial_write_char(serial_data, 'x');
+
+  platform_set_drvdata(pdev, serial_data);
+
+  err = generate_unique_device_id(pdev, &dev_id);
+  if (err) {
+    pr_err("Unable to generate unique device id.");
+    goto cleanup;
+  }
+
+  // Create minor automatically
+  serial_data->miscdev.minor = MISC_DYNAMIC_MINOR;
+  // Set unique name
+  serial_data->miscdev.name = dev_id;
+  // Set parent
+  serial_data->miscdev.parent = &pdev->dev;
+  // Set file operations
+  serial_data->miscdev.fops = &serial_fops;
+
+  err = misc_register(&serial_data->miscdev);
+  if (err) {
+    pr_err("Unable to register device in misc filesystem");
+    goto cleanup;
+  }
 
   return 0;
 
@@ -90,19 +126,24 @@ cleanup:
 }
 
 int serial_remove(struct platform_device *pdev) {
+  struct serial_dev_data *serial_data;
+
   pr_info("Called %s\n", __func__);
 
   destroy_ti_proc_specific_settings(pdev);
 
+  serial_data = platform_get_drvdata(pdev);
+  misc_deregister(&serial_data->miscdev);
+
   return 0;
 }
 
-u32 serial_read(struct serial_dev_data *serial_data, unsigned int offset) {
+u32 reg_read(struct serial_dev_data *serial_data, unsigned int offset) {
   return readl(serial_data->regs + (offset * 4));
 }
 
-void serial_write(struct serial_dev_data *serial_data, u32 val,
-                  unsigned int offset) {
+void reg_write(struct serial_dev_data *serial_data, u32 val,
+               unsigned int offset) {
   writel(val, serial_data->regs + (offset * 4));
 }
 
@@ -129,25 +170,50 @@ int serial_configure_baud_rate(struct platform_device *pdev,
   }
 
   baud_divisor = uartclk / 16 / 115200;
-  serial_write(serial_data, 0x07, UART_OMAP_MDR1);
-  serial_write(serial_data, 0x00, UART_LCR);
-  serial_write(serial_data, UART_LCR_DLAB, UART_LCR);
-  serial_write(serial_data, baud_divisor & 0xff, UART_DLL);
-  serial_write(serial_data, (baud_divisor >> 8) & 0xff, UART_DLM);
-  serial_write(serial_data, UART_LCR_WLEN8, UART_LCR);
-  serial_write(serial_data, 0x00, UART_OMAP_MDR1);
+  reg_write(serial_data, 0x07, UART_OMAP_MDR1);
+  reg_write(serial_data, 0x00, UART_LCR);
+  reg_write(serial_data, UART_LCR_DLAB, UART_LCR);
+  reg_write(serial_data, baud_divisor & 0xff, UART_DLL);
+  reg_write(serial_data, (baud_divisor >> 8) & 0xff, UART_DLM);
+  reg_write(serial_data, UART_LCR_WLEN8, UART_LCR);
+  reg_write(serial_data, 0x00, UART_OMAP_MDR1);
 
   /* Clear UART FIFOs */
-  serial_write(serial_data, UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT,
-               UART_FCR);
+  reg_write(serial_data, UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT, UART_FCR);
 
   return 0;
 }
 
 void serial_write_char(struct serial_dev_data *serial_data, char c) {
-  while (!(serial_read(serial_data, UART_LSR) & UART_LSR_THRE)) {
+  while (!(reg_read(serial_data, UART_LSR) & UART_LSR_THRE)) {
     cpu_relax();
   }
 
-  serial_write(serial_data, c, UART_TX);
+  reg_write(serial_data, c, UART_TX);
 }
+
+int generate_unique_device_id(struct platform_device *pdev, char **buf) {
+  struct resource *res;
+  char *unique_id;
+
+  res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+
+  unique_id = devm_kasprintf(&pdev->dev, GFP_KERNEL, "serial-%x", res->start);
+  if (!unique_id) {
+    return -ENOMEM;
+  }
+
+  *buf = unique_id;
+
+  return 0;
+}
+
+ssize_t serial_read(struct file *file, char __user *buf, size_t buf_size,
+                    loff_t *buf_offset) {
+  return -EINVAL;
+};
+
+ssize_t serial_write(struct file *file, const char __user *buf, size_t buf_size,
+                     loff_t *buf_offset) {
+  return -EINVAL;
+};
