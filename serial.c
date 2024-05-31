@@ -232,10 +232,12 @@ ssize_t serial_write(struct file *file, const char __user *buf, size_t buf_size,
     }
 
     serial_write_char(serial_data, local_buf);
-  }
 
-  // This is required to fix '\n' displaying
-  serial_write_char(serial_data, '\r');
+    if (local_buf == '\n') {
+      // This is required to fix '\n' displaying
+      serial_write_char(serial_data, '\r');
+    }
+  }
 
   return buf_size;
 };
