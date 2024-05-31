@@ -208,12 +208,34 @@ int generate_unique_device_id(struct platform_device *pdev, char **buf) {
   return 0;
 }
 
+/* Take data from serial device and write it to userspace. */
 ssize_t serial_read(struct file *file, char __user *buf, size_t buf_size,
                     loff_t *buf_offset) {
   return -EINVAL;
 };
 
+/* Take data from userspace and write it to serial device. */
 ssize_t serial_write(struct file *file, const char __user *buf, size_t buf_size,
                      loff_t *buf_offset) {
-  return -EINVAL;
+  // This is the same as "serial_data->miscdev".
+  struct miscdevice *miscdev = file->private_data;
+  struct serial_dev_data *serial_data =
+      container_of(miscdev, struct serial_dev_data, miscdev);
+  char local_buf;
+  int err, i;
+
+  for (i = 0; i < buf_size; i++) {
+    err = get_user(local_buf, buf + i);
+    if (err) {
+      pr_err("Unable to get char from userspace.");
+      return -EFAULT;
+    }
+
+    serial_write_char(serial_data, local_buf);
+  }
+
+  // This is required to fix '\n' displaying
+  serial_write_char(serial_data, '\r');
+
+  return buf_size;
 };
