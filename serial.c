@@ -3,8 +3,10 @@
 /* ########################################################### */
 /* #                    Imports                              # */
 /* ########################################################### */
+#include "linux/printk.h"
 #include <linux/fs.h>
 #include <linux/init.h>
+#include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
@@ -32,6 +34,8 @@ static int serial_configure_baud_rate(struct platform_device *pdev,
                                       struct serial_dev_data *serial_data);
 static void serial_write_char(struct serial_dev_data *serial_data, char c);
 static int generate_unique_device_id(struct platform_device *pdev, char **buf);
+static int register_interrupt_service_handler(struct platform_device *pdev);
+static irqreturn_t interrupt_service_handler(int irq, void *arg);
 static ssize_t serial_read(struct file *file, char __user *buf, size_t buf_size,
                            loff_t *buf_offset);
 static ssize_t serial_write(struct file *file, const char __user *buf,
@@ -116,6 +120,12 @@ int serial_probe(struct platform_device *pdev) {
   err = misc_register(&serial_data->miscdev);
   if (err) {
     pr_err("Unable to register device in misc filesystem");
+    goto cleanup;
+  }
+
+  err = register_interrupt_service_handler(pdev);
+  if (err) {
+    pr_err("Unable to register interrupt service handler");
     goto cleanup;
   }
 
@@ -242,3 +252,40 @@ ssize_t serial_write(struct file *file, const char __user *buf, size_t buf_size,
 
   return buf_size;
 };
+
+int register_interrupt_service_handler(struct platform_device *pdev) {
+  struct serial_dev_data *serial_data;
+  int irq, err;
+
+  /* Get private data */
+  serial_data = platform_get_drvdata(pdev);
+
+  /* Enable interrupts */
+  reg_write(serial_data, UART_IER, UART_IER_RDI);
+
+  /* Request IRQ id */
+  irq = platform_get_irq(pdev, 0);
+
+  /* Register IRQ handler */
+  err = devm_request_irq(&(pdev->dev), irq, interrupt_service_handler, 0,
+                         serial_data->miscdev.name, serial_data);
+  if (err) {
+    pr_err("Unable to request interrupt service registration.");
+    return -ENOMEM;
+  }
+
+  return 0;
+}
+
+irqreturn_t interrupt_service_handler(int irq, void *arg) {
+  struct serial_dev_data *serial_data = arg;
+  u32 buf;
+
+  pr_info("Called %s\n", __func__);
+
+  buf = reg_read(serial_data, UART_RX);
+
+  pr_info("Value read: %c\n", buf);
+
+  return IRQ_HANDLED;
+}
