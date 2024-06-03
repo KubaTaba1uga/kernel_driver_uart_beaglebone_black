@@ -19,7 +19,7 @@
 /* ########################################################### */
 /* #                    Private declarations                 # */
 /* ########################################################### */
-#define SERIAL_BUFSIZE 16
+#define SERIAL_BUFSIZE 32
 
 struct serial_dev_data {
   void __iomem *regs;
@@ -91,6 +91,8 @@ int serial_probe(struct platform_device *pdev) {
   if (!serial_data) {
     return -ENOMEM;
   }
+
+  init_waitqueue_head(&serial_data->waiting_queue);
 
   serial_data->regs = devm_platform_ioremap_resource(pdev, 0);
   if (IS_ERR(serial_data->regs)) {
@@ -234,21 +236,26 @@ ssize_t serial_read(struct file *file, char __user *buf, size_t buf_size,
       container_of(miscdev, struct serial_dev_data, miscdev);
   int err;
 
-  if (serial_data->buf_rd_i != serial_data->buf_wr_i) {
-    err = put_user(serial_data->buf[serial_data->buf_rd_i], buf);
-    if (err) {
-      pr_err("Unable to copy serial data into userspace.");
-      return err;
-    }
-
-    serial_data->buf_rd_i++;
-
-    if (serial_data->buf_rd_i == SERIAL_BUFSIZE)
-      serial_data->buf_rd_i = 0;
-
-    return 1; // return number of characters read
+  err =
+      wait_event_interruptible(serial_data->waiting_queue,
+                               serial_data->buf_rd_i != serial_data->buf_wr_i);
+  if (err) {
+    pr_err("Unable to wait for interruptible event.");
+    return err;
   }
-  return 0;
+
+  err = put_user(serial_data->buf[serial_data->buf_rd_i], buf);
+  if (err) {
+    pr_err("Unable to copy serial data into userspace.");
+    return err;
+  }
+
+  serial_data->buf_rd_i++;
+
+  if (serial_data->buf_rd_i == SERIAL_BUFSIZE)
+    serial_data->buf_rd_i = 0;
+
+  return 1; // return number of characters read
 };
 
 /* Take data from userspace and write it to serial device. */
@@ -316,6 +323,8 @@ irqreturn_t interrupt_service_handler(int irq, void *arg) {
 
   if (serial_data->buf_wr_i == SERIAL_BUFSIZE)
     serial_data->buf_wr_i = 0;
+
+  wake_up(&serial_data->waiting_queue);
 
   return IRQ_HANDLED;
 }
