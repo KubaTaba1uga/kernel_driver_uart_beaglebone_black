@@ -3,7 +3,6 @@
 /* ########################################################### */
 /* #                    Imports                              # */
 /* ########################################################### */
-#include "linux/printk.h"
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
@@ -13,14 +12,22 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/printk.h>
+#include <linux/wait.h>
 #include <uapi/linux/serial_reg.h>
 
 /* ########################################################### */
-/* #                    Static declarations                  # */
+/* #                    Private declarations                 # */
 /* ########################################################### */
+#define SERIAL_BUFSIZE 16
+
 struct serial_dev_data {
   void __iomem *regs;
   struct miscdevice miscdev;
+  char buf[SERIAL_BUFSIZE];
+  unsigned int buf_rd_i;
+  unsigned int buf_wr_i;
+  wait_queue_head_t waiting_queue;
 };
 
 static int serial_probe(struct platform_device *pdev);
@@ -222,7 +229,26 @@ int generate_unique_device_id(struct platform_device *pdev, char **buf) {
 /* Take data from serial device and write it to userspace. */
 ssize_t serial_read(struct file *file, char __user *buf, size_t buf_size,
                     loff_t *buf_offset) {
-  return -EINVAL;
+  struct miscdevice *miscdev = file->private_data;
+  struct serial_dev_data *serial_data =
+      container_of(miscdev, struct serial_dev_data, miscdev);
+  int err;
+
+  if (serial_data->buf_rd_i != serial_data->buf_wr_i) {
+    err = put_user(serial_data->buf[serial_data->buf_rd_i], buf);
+    if (err) {
+      pr_err("Unable to copy serial data into userspace.");
+      return err;
+    }
+
+    serial_data->buf_rd_i++;
+
+    if (serial_data->buf_rd_i == SERIAL_BUFSIZE)
+      serial_data->buf_rd_i = 0;
+
+    return 1; // return number of characters read
+  }
+  return 0;
 };
 
 /* Take data from userspace and write it to serial device. */
@@ -285,7 +311,11 @@ irqreturn_t interrupt_service_handler(int irq, void *arg) {
 
   buf = reg_read(serial_data, UART_RX);
 
-  pr_info("Value read: %c\n", buf);
+  serial_data->buf[serial_data->buf_wr_i] = buf;
+  serial_data->buf_wr_i++;
+
+  if (serial_data->buf_wr_i == SERIAL_BUFSIZE)
+    serial_data->buf_wr_i = 0;
 
   return IRQ_HANDLED;
 }
