@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
-// TO-DO: implement serial_read
 /* ########################################################### */
 /* #                    Imports                              # */
 /* ########################################################### */
+#include "linux/spinlock.h"
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
@@ -13,6 +13,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/printk.h>
+#include <linux/slab.h>
 #include <linux/wait.h>
 #include <uapi/linux/serial_reg.h>
 
@@ -28,6 +29,7 @@ struct serial_dev_data {
   unsigned int buf_rd_i;
   unsigned int buf_wr_i;
   wait_queue_head_t waiting_queue;
+  spinlock_t registers_lock;
 };
 
 static int serial_probe(struct platform_device *pdev);
@@ -79,7 +81,6 @@ module_platform_driver(serial_driver);
 /* ########################################################### */
 /* #                    Private API                          # */
 /* ########################################################### */
-
 int serial_probe(struct platform_device *pdev) {
   struct serial_dev_data *serial_data;
   char *dev_id;
@@ -93,6 +94,7 @@ int serial_probe(struct platform_device *pdev) {
   }
 
   init_waitqueue_head(&serial_data->waiting_queue);
+  spin_lock_init(&serial_data->registers_lock);
 
   serial_data->regs = devm_platform_ioremap_resource(pdev, 0);
   if (IS_ERR(serial_data->regs)) {
@@ -106,8 +108,6 @@ int serial_probe(struct platform_device *pdev) {
     pr_err("Unable to configure baud rate.");
     goto cleanup;
   }
-
-  serial_write_char(serial_data, 'x');
 
   platform_set_drvdata(pdev, serial_data);
 
@@ -205,11 +205,16 @@ int serial_configure_baud_rate(struct platform_device *pdev,
 }
 
 void serial_write_char(struct serial_dev_data *serial_data, char c) {
+  unsigned long flags;
+  spin_lock_irqsave(&serial_data->registers_lock, flags);
+
   while (!(reg_read(serial_data, UART_LSR) & UART_LSR_THRE)) {
     cpu_relax();
   }
 
   reg_write(serial_data, c, UART_TX);
+
+  spin_unlock_irqrestore(&serial_data->registers_lock, flags);
 }
 
 int generate_unique_device_id(struct platform_device *pdev, char **buf) {
@@ -236,6 +241,8 @@ ssize_t serial_read(struct file *file, char __user *buf, size_t buf_size,
       container_of(miscdev, struct serial_dev_data, miscdev);
   int err;
 
+  // We do not need to lock here because write is already locked, if any change
+  // occurs it have to be in locked context.
   err =
       wait_event_interruptible(serial_data->waiting_queue,
                                serial_data->buf_rd_i != serial_data->buf_wr_i);
@@ -265,6 +272,7 @@ ssize_t serial_write(struct file *file, const char __user *buf, size_t buf_size,
   struct miscdevice *miscdev = file->private_data;
   struct serial_dev_data *serial_data =
       container_of(miscdev, struct serial_dev_data, miscdev);
+
   char local_buf;
   int err, i;
 
@@ -312,9 +320,12 @@ int register_interrupt_service_handler(struct platform_device *pdev) {
 
 irqreturn_t interrupt_service_handler(int irq, void *arg) {
   struct serial_dev_data *serial_data = arg;
+  unsigned long flags;
   u32 buf;
 
   pr_info("Called %s\n", __func__);
+
+  spin_lock_irqsave(&serial_data->registers_lock, flags);
 
   buf = reg_read(serial_data, UART_RX);
 
@@ -323,6 +334,8 @@ irqreturn_t interrupt_service_handler(int irq, void *arg) {
 
   if (serial_data->buf_wr_i == SERIAL_BUFSIZE)
     serial_data->buf_wr_i = 0;
+
+  spin_unlock_irqrestore(&serial_data->registers_lock, flags);
 
   wake_up(&serial_data->waiting_queue);
 
